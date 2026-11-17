@@ -1,5 +1,6 @@
-package org.example;
 // ClientMain.java
+package org.example;
+
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import javafx.application.Application;
@@ -24,16 +25,19 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 public class ClientMain extends Application {
 
-    private record VoteRequest(String action, String choice) {}
+    private record VoteRequest(String action, String choice, String clientId) {}
 
     private record ResultsMessage(Map<String, Integer> results) {}
 
     private static final String HOST = "localhost";
     private static final int PORT = 8080;
     private static final List<String> OPTIONS = List.of("Вариант А", "Вариант Б", "Вариант В");
+
+    private final String clientId = UUID.randomUUID().toString();
 
     private final Gson gson = new Gson();
     private final Map<String, PieChart.Data> slices = new LinkedHashMap<>();
@@ -96,7 +100,7 @@ public class ClientMain extends Application {
         if (out == null) {
             return;
         }
-        out.println(gson.toJson(new VoteRequest("vote", choice)));
+        out.println(gson.toJson(new VoteRequest("vote", choice, clientId)));
         if (out.checkError()) {
             buttons.setDisable(true);
         }
