@@ -1,4 +1,3 @@
-// ClientHandler.java
 package org.example;
 
 import com.google.gson.Gson;
@@ -15,9 +14,14 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
 public class ClientHandler implements Runnable {
-    private record Request(String action, Integer pollId, Integer choiceId, String clientId) {}
+    private static final String ROLE_HOST = "host";
+    private static final String ROLE_CLIENT = "client";
 
-    private record StatusResponse(String type, String message) {}
+    private record Request(String action, String role, String clientId,
+                           Integer pollId, Integer questionIndex,
+                           Integer questionId, Integer optionId) {}
+
+    private record StatusResponse(String type, String code, String message, Integer questionId) {}
 
     private final Socket socket;
     private final Connection db;
@@ -54,7 +58,7 @@ public class ClientHandler implements Runnable {
             if (session != null) {
                 ServerMain.removeSession(session);
             }
-            System.out.println("[" + name + "] Клиент отключен");
+            System.out.println("[" + name + "] Клиент отключен (" + (session != null ? session.role() : "?") + ")");
         }
     }
 
@@ -63,94 +67,163 @@ public class ClientHandler implements Runnable {
         try {
             request = gson.fromJson(message, Request.class);
         } catch (JsonSyntaxException e) {
-            sendStatus("error", "Некорректный JSON");
+            sendStatus("error", "bad_json", "Некорректный JSON", null);
             return;
         }
         if (request == null || request.action() == null) {
-            sendStatus("error", "Не указано поле action");
+            sendStatus("error", "no_action", "Не указано поле action", null);
+            return;
+        }
+
+        if ("hello".equals(request.action())) {
+            handleHello(request);
+            return;
+        }
+        if (session.role() == null) {
+            sendStatus("error", "no_hello", "Сначала отправьте hello с ролью", null);
             return;
         }
 
         switch (request.action()) {
-            case "get_polls" -> handleGetPolls();
-            case "get_results" -> handleGetResults(request);
+            case "host_open_poll" -> handleOpenPoll(request);
+            case "host_set_question" -> handleSetQuestion(request);
+            case "host_close_poll" -> handleClosePoll();
             case "vote" -> handleVote(request);
-            default -> sendStatus("error", "Неизвестное действие: " + request.action());
+            default -> sendStatus("error", "unknown_action", "Неизвестное действие: " + request.action(), null);
         }
     }
 
-    private void handleGetPolls() {
-        // Клиент вернулся к списку, значит ни один опрос он больше не смотрит
-        session.setViewingPollId(null);
-        session.send(gson.toJson(new ServerMain.PollsResponse("polls", ServerMain.listPolls())));
+    // ---------- hello ----------
+
+    private void handleHello(Request request) {
+        String role = request.role();
+        if (!ROLE_HOST.equals(role) && !ROLE_CLIENT.equals(role)) {
+            sendStatus("error", "bad_role", "Роль должна быть host или client", null);
+            return;
+        }
+        String clientId = request.clientId();
+        if (ROLE_CLIENT.equals(role) && (clientId == null || clientId.isBlank())) {
+            sendStatus("error", "no_client_id", "Не указан clientId", null);
+            return;
+        }
+
+        session.setIdentity(role, clientId);
+
+        if (ROLE_HOST.equals(role)) {
+            session.send(ServerMain.catalogJson());
+        }
+        session.send(ServerMain.currentStateJson());
     }
 
-    private void handleGetResults(Request request) {
+    // ---------- Действия ведущего ----------
+
+    private boolean requireHost() {
+        if (!ROLE_HOST.equals(session.role())) {
+            sendStatus("error", "forbidden", "Действие доступно только ведущему", null);
+            return false;
+        }
+        return true;
+    }
+
+    private void handleOpenPoll(Request request) {
+        if (!requireHost()) {
+            return;
+        }
         if (request.pollId() == null) {
-            sendStatus("error", "Не указан pollId");
+            sendStatus("error", "bad_request", "Не указан pollId", null);
             return;
         }
-        ServerMain.ResultsResponse results = ServerMain.buildResults(request.pollId());
-        if (results == null) {
-            sendStatus("error", "Опрос не найден: " + request.pollId());
-            return;
+        if (!ServerMain.openPoll(request.pollId())) {
+            sendStatus("error", "poll_not_found", "Опрос не найден или в нём нет вопросов: " + request.pollId(), null);
         }
-        // С этого момента клиент получает рассылки по этому опросу
-        session.setViewingPollId(request.pollId());
-        session.send(gson.toJson(results));
     }
+
+    private void handleSetQuestion(Request request) {
+        if (!requireHost()) {
+            return;
+        }
+        if (request.questionIndex() == null) {
+            sendStatus("error", "bad_request", "Не указан questionIndex", null);
+            return;
+        }
+        if (!ServerMain.setQuestion(request.questionIndex())) {
+            sendStatus("error", "bad_question_index",
+                    "Нет открытого опроса или вопроса с номером " + request.questionIndex(), null);
+        }
+    }
+
+    private void handleClosePoll() {
+        if (!requireHost()) {
+            return;
+        }
+        ServerMain.closePoll();
+    }
+
+    // ---------- Голосование ----------
 
     private void handleVote(Request request) {
-        if (request.pollId() == null || request.choiceId() == null) {
-            sendStatus("error", "Не указаны pollId или choiceId");
+        if (!ROLE_CLIENT.equals(session.role())) {
+            sendStatus("error", "forbidden", "Голосовать могут только участники", null);
             return;
         }
-        if (request.clientId() == null || request.clientId().isBlank()) {
-            sendStatus("error", "Не указан clientId");
+        if (request.questionId() == null || request.optionId() == null) {
+            sendStatus("error", "bad_request", "Не указаны questionId или optionId", null);
             return;
         }
-        int pollId = request.pollId();
-        int choiceId = request.choiceId();
 
-        if (!ServerMain.hasOption(pollId, choiceId)) {
-            sendStatus("error", "В опросе " + pollId + " нет варианта " + choiceId);
+        String clientId = (request.clientId() != null && !request.clientId().isBlank())
+                ? request.clientId()
+                : session.clientId();
+        int questionId = request.questionId();
+        int optionId = request.optionId();
+
+        Integer activeId = ServerMain.activeQuestionId();
+        if (activeId == null) {
+            sendStatus("error", "no_active_poll", "Сейчас нет открытого опроса", questionId);
+            return;
+        }
+        if (activeId != questionId) {
+            sendStatus("error", "question_not_active", "Этот вопрос сейчас не активен", questionId);
+            return;
+        }
+        if (!ServerMain.hasOption(questionId, optionId)) {
+            sendStatus("error", "bad_option", "В вопросе " + questionId + " нет варианта " + optionId, questionId);
             return;
         }
 
         boolean accepted;
         try {
-            accepted = saveVote(request.clientId(), pollId, choiceId);
+            accepted = saveVote(clientId, questionId, optionId);
         } catch (SQLException e) {
             System.err.println("Ошибка записи голоса в БД: " + e.getMessage());
-            sendStatus("error", "Ошибка сервера при сохранении голоса");
+            sendStatus("error", "db_error", "Ошибка сервера при сохранении голоса", questionId);
             return;
         }
 
         if (!accepted) {
-            System.out.println("Клиент " + request.clientId() + " уже голосовал в опросе " + pollId);
-            sendStatus("error", "Вы уже голосовали в этом опросе");
+            System.out.println("Клиент " + clientId + " уже голосовал в вопросе " + questionId);
+            sendStatus("error", "already_voted", "Вы уже голосовали в этом вопросе", questionId);
             return;
         }
 
-        ServerMain.registerVote(pollId, choiceId);
-        sendStatus("vote_ok", "Голос принят");
-        ServerMain.broadcastResults(pollId);
+        sendStatus("vote_ok", null, "Ваш голос учтён", questionId);
+        ServerMain.voteAccepted(optionId);
     }
 
     /**
-     * Регистрирует избирателя и увеличивает счетчик в одной транзакции.
-     * INSERT OR IGNORE вернет 0 строк, если пара (client_id, poll_id) уже есть.
+     * Регистрирует избирателя и увеличивает счётчик варианта в одной транзакции.
+     * INSERT OR IGNORE вернёт 0 строк, если пара (client_id, question_id) уже есть.
      * Соединение SQLite общее, поэтому доступ к нему сериализован.
      */
-    private boolean saveVote(String clientId, int pollId, int choiceId) throws SQLException {
+    private boolean saveVote(String clientId, int questionId, int optionId) throws SQLException {
         synchronized (db) {
             boolean previousAutoCommit = db.getAutoCommit();
             db.setAutoCommit(false);
             try {
                 try (PreparedStatement insert = db.prepareStatement(
-                        "INSERT OR IGNORE INTO voters (client_id, poll_id) VALUES (?, ?)")) {
+                        "INSERT OR IGNORE INTO voters (client_id, question_id) VALUES (?, ?)")) {
                     insert.setString(1, clientId);
-                    insert.setInt(2, pollId);
+                    insert.setInt(2, questionId);
                     if (insert.executeUpdate() == 0) {
                         db.rollback();
                         return false;
@@ -158,9 +231,9 @@ public class ClientHandler implements Runnable {
                 }
 
                 try (PreparedStatement update = db.prepareStatement(
-                        "UPDATE options SET votes = votes + 1 WHERE id = ? AND poll_id = ?")) {
-                    update.setInt(1, choiceId);
-                    update.setInt(2, pollId);
+                        "UPDATE options SET votes = votes + 1 WHERE id = ? AND question_id = ?")) {
+                    update.setInt(1, optionId);
+                    update.setInt(2, questionId);
                     if (update.executeUpdate() != 1) {
                         db.rollback();
                         return false;
@@ -178,7 +251,7 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    private void sendStatus(String type, String message) {
-        session.send(gson.toJson(new StatusResponse(type, message)));
+    private void sendStatus(String type, String code, String message, Integer questionId) {
+        session.send(gson.toJson(new StatusResponse(type, code, message, questionId)));
     }
 }
