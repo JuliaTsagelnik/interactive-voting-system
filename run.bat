@@ -9,6 +9,10 @@ start "Voting Server" /D "%~dp0" "%JAVA%" -jar "%SERVER_JAR%"
 
 timeout /t 3 /nobreak >nul
 
+start "Voting Host" "%JAVA%" -jar "%CLIENT_JAR%" --host
+
+timeout /t 1 /nobreak >nul
+
 start "Voting Client 1" "%JAVA%" -jar "%CLIENT_JAR%"
 start "Voting Client 2" "%JAVA%" -jar "%CLIENT_JAR%"
 start "Voting Client 3" "%JAVA%" -jar "%CLIENT_JAR%"
