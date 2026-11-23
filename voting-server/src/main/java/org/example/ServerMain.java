@@ -1,3 +1,4 @@
+// ServerMain.java
 package org.example;
 
 import com.google.gson.Gson;
@@ -19,6 +20,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -26,16 +28,21 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ServerMain {
     private static final int PORT = 8080;
     private static final String DB_URL = "jdbc:sqlite:voting.db";
     private static final String POLLS_RESOURCE = "/polls.json";
+    private static final int MAX_NAME_LENGTH = 40;
 
     // ---------- Формат polls.json ----------
 
     public record SeedQuestion(String text, List<String> options) {}
-    public record SeedPoll(String title, List<SeedQuestion> questions) {}
+    /** profiles необязательно: ключи option1, option2, option3, mixed. */
+    public record SeedPoll(String title, List<SeedQuestion> questions, Map<String, String> profiles) {}
     public record SeedTheme(String theme, List<SeedPoll> polls) {}
 
     // ---------- Форматы ответов сервера ----------
@@ -49,6 +56,18 @@ public class ServerMain {
                                          int questionId, int questionIndex, int totalQuestions,
                                          String text, List<OptionResult> options) {}
 
+    // Итоги опроса (orderNum и questionNumber нумеруются с единицы)
+    public record SummaryOption(int id, String text, int votes) {}
+    public record SummaryQuestion(int orderNum, String text, int totalVotes, List<SummaryOption> options) {}
+    public record SummaryAnswer(int questionNumber, String questionText, String optionText) {}
+    public record SummaryParticipant(String clientId, String displayName, int answeredCount, int totalQuestions,
+                                     List<Integer> optionIndexCounts, int majorityMatchPercent,
+                                     String verdict, List<SummaryAnswer> answers) {}
+    public record PollSummaryResponse(String type, int pollId, String theme, String pollTitle,
+                                      List<SummaryQuestion> questions, List<SummaryParticipant> participants) {}
+
+    public enum FinishResult { OK, NO_ACTIVE_POLL, ALREADY_FINISHED }
+
     // ---------- Данные в памяти (структура после загрузки не меняется, меняются только голоса) ----------
 
     private record OptionData(int id, String text) {}
@@ -56,23 +75,34 @@ public class ServerMain {
     private record PollData(int id, int themeId, String title, List<QuestionData> questions) {}
     private record ThemeData(int id, String title, List<PollData> polls) {}
 
-    private record ActiveState(int pollId, int questionIndex) {}
+    /**
+     * Состояние активного опроса. finished = true означает, что опрос завершён
+     * и summaryJson содержит готовый poll_summary (null только внутри finishPoll).
+     */
+    private record ActiveState(int pollId, int questionIndex, boolean finished, String summaryJson) {}
 
     private static final List<ThemeData> themes = new ArrayList<>();
     private static final Map<Integer, String> themeTitles = new HashMap<>();
     private static final Map<Integer, PollData> pollsById = new HashMap<>();
     private static final Map<Integer, QuestionData> questionsById = new HashMap<>();
+    // Профили из polls.json по названию опроса; пусто, если в файле их нет
+    private static final Map<String, Map<String, String>> profilesByPollTitle = new HashMap<>();
     // optionId -> число голосов
     private static final Map<Integer, Integer> optionVotes = new ConcurrentHashMap<>();
 
-    // Активный опрос и номер вопроса. null, пока ведущий ничего не открыл.
-    private static volatile ActiveState active;
+    // clientId -> имя. Хранится и после отключения клиента, чтобы имя попало в итоги.
+    private static final Map<String, String> clientNames = new ConcurrentHashMap<>();
+    private static final AtomicInteger participantCounter = new AtomicInteger();
 
-    /** Подключение клиента: поток вывода, роль и идентификатор, присланные в hello. */
+    private static volatile ActiveState active;
+    private static Connection database;
+
+    /** Подключение клиента: поток вывода, роль, идентификатор и имя из hello. */
     public static final class ClientSession {
         private final PrintWriter out;
         private volatile String role;
         private volatile String clientId;
+        private volatile String displayName;
 
         public ClientSession(PrintWriter out) {
             this.out = out;
@@ -94,9 +124,14 @@ public class ServerMain {
             return clientId;
         }
 
-        public void setIdentity(String role, String clientId) {
+        public String displayName() {
+            return displayName;
+        }
+
+        public void setIdentity(String role, String clientId, String displayName) {
             this.role = role;
             this.clientId = clientId;
+            this.displayName = displayName;
         }
     }
 
@@ -109,10 +144,13 @@ public class ServerMain {
         try (Connection db = DriverManager.getConnection(DB_URL);
              ServerSocket serverSocket = new ServerSocket(PORT)) {
 
+            database = db;
             initDatabase(db);
             loadData(db);
+            loadProfiles();
             System.out.println("База подключена. Тем: " + themes.size() + ", опросов: " + pollsById.size()
-                    + ", вопросов: " + questionsById.size());
+                    + ", вопросов: " + questionsById.size()
+                    + ", опросов с профилями: " + profilesByPollTitle.size());
 
             System.out.println("Сервер запущен, порт " + PORT + ". Ожидание подключений...");
 
@@ -171,6 +209,7 @@ public class ServerMain {
                     CREATE TABLE IF NOT EXISTS voters (
                         client_id   TEXT NOT NULL,
                         question_id INTEGER NOT NULL,
+                        option_id   INTEGER NOT NULL,
                         PRIMARY KEY (client_id, question_id)
                     )""");
         }
@@ -195,7 +234,7 @@ public class ServerMain {
                 "polls", Set.of("id", "theme_id", "title"),
                 "questions", Set.of("id", "poll_id", "order_num", "text"),
                 "options", Set.of("id", "question_id", "text", "votes"),
-                "voters", Set.of("client_id", "question_id"));
+                "voters", Set.of("client_id", "question_id", "option_id"));
 
         boolean incompatible = false;
         for (Map.Entry<String, Set<String>> entry : expected.entrySet()) {
@@ -229,19 +268,23 @@ public class ServerMain {
         return columns;
     }
 
-    private static void seedFromResource(Connection db) throws SQLException, IOException {
-        SeedTheme[] seed;
+    private static SeedTheme[] readSeed() throws IOException {
         try (InputStream is = ServerMain.class.getResourceAsStream(POLLS_RESOURCE)) {
             if (is == null) {
                 throw new IOException("Ресурс " + POLLS_RESOURCE + " не найден в classpath");
             }
             try (Reader reader = new InputStreamReader(is, StandardCharsets.UTF_8)) {
-                seed = gson.fromJson(reader, SeedTheme[].class);
+                SeedTheme[] seed = gson.fromJson(reader, SeedTheme[].class);
+                if (seed == null || seed.length == 0) {
+                    throw new IOException("Файл " + POLLS_RESOURCE + " пуст");
+                }
+                return seed;
             }
         }
-        if (seed == null || seed.length == 0) {
-            throw new IOException("Файл " + POLLS_RESOURCE + " пуст");
-        }
+    }
+
+    private static void seedFromResource(Connection db) throws SQLException, IOException {
+        SeedTheme[] seed = readSeed();
 
         db.setAutoCommit(false);
         try {
@@ -336,6 +379,43 @@ public class ServerMain {
         }
     }
 
+    /**
+     * Профили читаются из polls.json при каждом старте, а не из БД, поэтому их можно
+     * добавить в файл позже без пересоздания базы. Отсутствие поля или ошибка чтения не критичны.
+     */
+    private static void loadProfiles() {
+        try {
+            for (SeedTheme theme : readSeed()) {
+                if (theme.polls() == null) {
+                    continue;
+                }
+                for (SeedPoll poll : theme.polls()) {
+                    if (poll.profiles() != null && !poll.profiles().isEmpty()) {
+                        profilesByPollTitle.put(poll.title(), Map.copyOf(poll.profiles()));
+                    }
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            System.err.println("Профили из " + POLLS_RESOURCE + " не загружены, будут использованы универсальные: "
+                    + e.getMessage());
+        }
+    }
+
+    // ---------- Имена участников ----------
+
+    /** Сохраняет имя клиента. Если имя не передано, назначает «Участник N» (один раз на clientId). */
+    public static String registerName(String clientId, String requested) {
+        if (requested != null && !requested.isBlank()) {
+            String name = requested.trim();
+            if (name.length() > MAX_NAME_LENGTH) {
+                name = name.substring(0, MAX_NAME_LENGTH);
+            }
+            clientNames.put(clientId, name);
+            return name;
+        }
+        return clientNames.computeIfAbsent(clientId, k -> "Участник " + participantCounter.incrementAndGet());
+    }
+
     // ---------- Каталог и состояние ----------
 
     public static CatalogResponse buildCatalog() {
@@ -354,11 +434,17 @@ public class ServerMain {
         return gson.toJson(buildCatalog());
     }
 
-    /** JSON текущего состояния: active_question, если опрос открыт, иначе waiting. */
-    public static String currentStateJson() {
+    /**
+     * JSON текущего состояния: waiting, active_question или poll_summary.
+     * Метод синхронизирован, чтобы не отдать состояние в середине finishPoll.
+     */
+    public static synchronized String currentStateJson() {
         ActiveState state = active;
         if (state == null) {
             return gson.toJson(new WaitingResponse("waiting"));
+        }
+        if (state.finished()) {
+            return state.summaryJson();
         }
         PollData poll = pollsById.get(state.pollId());
         QuestionData question = poll.questions().get(state.questionIndex());
@@ -372,13 +458,22 @@ public class ServerMain {
                 poll.questions().size(), question.text(), options));
     }
 
-    /** Id текущего вопроса или null, если опрос не открыт. */
+    /**
+     * Id текущего вопроса или null, если опрос не открыт либо завершён.
+     * Намеренно не synchronized: вызывается из ClientHandler под замком БД,
+     * а finishPoll берёт замки в обратном порядке.
+     */
     public static Integer activeQuestionId() {
         ActiveState state = active;
-        if (state == null) {
+        if (state == null || state.finished()) {
             return null;
         }
         return pollsById.get(state.pollId()).questions().get(state.questionIndex()).id();
+    }
+
+    public static boolean isPollFinished() {
+        ActiveState state = active;
+        return state != null && state.finished();
     }
 
     public static boolean hasOption(int questionId, int optionId) {
@@ -401,21 +496,21 @@ public class ServerMain {
         if (poll == null || poll.questions().isEmpty()) {
             return false;
         }
-        active = new ActiveState(pollId, 0);
+        active = new ActiveState(pollId, 0, false, null);
         broadcastState();
         return true;
     }
 
     public static synchronized boolean setQuestion(int questionIndex) {
         ActiveState state = active;
-        if (state == null) {
+        if (state == null || state.finished()) {
             return false;
         }
         int total = pollsById.get(state.pollId()).questions().size();
         if (questionIndex < 0 || questionIndex >= total) {
             return false;
         }
-        active = new ActiveState(state.pollId(), questionIndex);
+        active = new ActiveState(state.pollId(), questionIndex, false, null);
         broadcastState();
         return true;
     }
@@ -425,10 +520,228 @@ public class ServerMain {
         broadcastState();
     }
 
+    /**
+     * Завершает опрос: закрывает приём голосов, читает все голоса из SQLite,
+     * считает итоги и рассылает poll_summary. Порядок замков: класс, затем БД.
+     */
+    public static synchronized FinishResult finishPoll() throws SQLException {
+        ActiveState state = active;
+        if (state == null) {
+            return FinishResult.NO_ACTIVE_POLL;
+        }
+        if (state.finished()) {
+            return FinishResult.ALREADY_FINISHED;
+        }
+        PollData poll = pollsById.get(state.pollId());
+
+        String summaryJson;
+        synchronized (database) {
+            // Сначала закрываем приём голосов: голос, который успеет в БД раньше, попадёт в итоги,
+            // а все последующие saveVote увидят finished и откажут.
+            active = new ActiveState(state.pollId(), state.questionIndex(), true, null);
+            try {
+                summaryJson = gson.toJson(buildSummary(poll));
+            } catch (SQLException | RuntimeException e) {
+                active = state;
+                throw e;
+            }
+        }
+
+        active = new ActiveState(state.pollId(), state.questionIndex(), true, summaryJson);
+        broadcastState();
+        return FinishResult.OK;
+    }
+
     /** Учитывает принятый (уже записанный в БД) голос в памяти и рассылает новое состояние. */
     public static synchronized void voteAccepted(int optionId) {
         optionVotes.merge(optionId, 1, Integer::sum);
-        broadcastState();
+        ActiveState state = active;
+        if (state != null && !state.finished()) {
+            broadcastState();
+        }
+    }
+
+    // ---------- Итоги ----------
+
+    /** Вызывается под замком БД. */
+    private static PollSummaryResponse buildSummary(PollData poll) throws SQLException {
+        // clientId -> (questionId -> optionId), в порядке первого появления
+        Map<String, Map<Integer, Integer>> answersByClient = new LinkedHashMap<>();
+        // optionId -> число голосов в рамках этого опроса
+        Map<Integer, Integer> optionCounts = new HashMap<>();
+
+        try (PreparedStatement ps = database.prepareStatement("""
+                SELECT v.client_id, v.question_id, v.option_id
+                FROM voters v
+                JOIN questions q ON q.id = v.question_id
+                WHERE q.poll_id = ?""")) {
+            ps.setInt(1, poll.id());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String clientId = rs.getString("client_id");
+                    int questionId = rs.getInt("question_id");
+                    int optionId = rs.getInt("option_id");
+                    answersByClient.computeIfAbsent(clientId, k -> new HashMap<>()).put(questionId, optionId);
+                    optionCounts.merge(optionId, 1, Integer::sum);
+                }
+            }
+        }
+
+        int maxOptions = 0;
+        List<SummaryQuestion> summaryQuestions = new ArrayList<>();
+        Map<Integer, Integer> leaderVotes = new HashMap<>(); // questionId -> максимум голосов
+        int number = 0;
+        for (QuestionData question : poll.questions()) {
+            number++;
+            maxOptions = Math.max(maxOptions, question.options().size());
+
+            List<SummaryOption> options = new ArrayList<>();
+            int total = 0;
+            int max = 0;
+            for (OptionData option : question.options()) {
+                int votes = optionCounts.getOrDefault(option.id(), 0);
+                options.add(new SummaryOption(option.id(), option.text(), votes));
+                total += votes;
+                max = Math.max(max, votes);
+            }
+            leaderVotes.put(question.id(), max);
+            summaryQuestions.add(new SummaryQuestion(number, question.text(), total, options));
+        }
+
+        List<SummaryParticipant> participants = new ArrayList<>();
+        for (Map.Entry<String, Map<Integer, Integer>> entry : answersByClient.entrySet()) {
+            SummaryParticipant participant = buildParticipant(poll, entry.getKey(), entry.getValue(),
+                    maxOptions, optionCounts, leaderVotes);
+            if (participant != null) {
+                participants.add(participant);
+            }
+        }
+        participants.sort((a, b) -> compareNames(a.displayName(), b.displayName()));
+
+        return new PollSummaryResponse("poll_summary", poll.id(), themeTitles.get(poll.themeId()),
+                poll.title(), summaryQuestions, participants);
+    }
+
+    private static SummaryParticipant buildParticipant(PollData poll, String clientId,
+                                                       Map<Integer, Integer> chosen, int maxOptions,
+                                                       Map<Integer, Integer> optionCounts,
+                                                       Map<Integer, Integer> leaderVotes) {
+        int[] indexCounts = new int[maxOptions];
+        List<SummaryAnswer> answers = new ArrayList<>();
+        int matches = 0;
+
+        int number = 0;
+        for (QuestionData question : poll.questions()) {
+            number++;
+            Integer optionId = chosen.get(question.id());
+            if (optionId == null) {
+                continue;
+            }
+            int index = -1;
+            for (int i = 0; i < question.options().size(); i++) {
+                if (question.options().get(i).id() == optionId) {
+                    index = i;
+                    break;
+                }
+            }
+            if (index < 0) {
+                continue;
+            }
+            indexCounts[index]++;
+            answers.add(new SummaryAnswer(number, question.text(), question.options().get(index).text()));
+
+            // Совпадение с большинством: у выбранного варианта максимум голосов в вопросе (при ничьей совпадают все лидеры)
+            int max = leaderVotes.getOrDefault(question.id(), 0);
+            if (max > 0 && optionCounts.getOrDefault(optionId, 0) == max) {
+                matches++;
+            }
+        }
+
+        int answered = answers.size();
+        if (answered == 0) {
+            return null;
+        }
+        int matchPercent = (int) Math.round(matches * 100.0 / answered);
+
+        int best = 0;
+        for (int count : indexCounts) {
+            best = Math.max(best, count);
+        }
+        int bestIndex = -1;
+        int leaders = 0;
+        for (int i = 0; i < indexCounts.length; i++) {
+            if (indexCounts[i] == best) {
+                leaders++;
+                bestIndex = i;
+            }
+        }
+        boolean mixed = leaders != 1;
+
+        String verdict = buildVerdict(poll, mixed ? -1 : bestIndex, best, answered, matchPercent);
+
+        List<Integer> counts = new ArrayList<>();
+        for (int count : indexCounts) {
+            counts.add(count);
+        }
+        String name = clientNames.getOrDefault(clientId, "Участник");
+        return new SummaryParticipant(clientId, name, answered, poll.questions().size(), counts,
+                matchPercent, verdict, answers);
+    }
+
+    /** dominantIndex = -1 означает смешанный тип (поровну между несколькими вариантами). */
+    private static String buildVerdict(PollData poll, int dominantIndex, int dominantCount,
+                                       int answered, int matchPercent) {
+        Map<String, String> profiles = profilesByPollTitle.get(poll.title());
+        if (profiles != null) {
+            String key = dominantIndex < 0 ? "mixed" : "option" + (dominantIndex + 1);
+            String text = profiles.get(key);
+            if (text != null && !text.isBlank()) {
+                return text;
+            }
+        }
+
+        String closeness;
+        if (matchPercent >= 70) {
+            closeness = "Ваша позиция близка к общему мнению группы.";
+        } else if (matchPercent <= 30) {
+            closeness = "Ваша позиция заметно отличается от мнения большинства.";
+        } else {
+            closeness = "Ваша позиция лишь отчасти совпадает с мнением большинства.";
+        }
+
+        String lead;
+        if (dominantIndex < 0) {
+            lead = "Ваши ответы распределились между вариантами примерно поровну, "
+                    + "устойчивого предпочтения нет.";
+        } else {
+            lead = "Чаще всего вы выбирали вариант №" + (dominantIndex + 1)
+                    + " (" + dominantCount + " из " + answered + ").";
+        }
+        return lead + " С большинством вы совпали в " + matchPercent + "% вопросов. " + closeness;
+    }
+
+    /** Сортировка «Участник 2» перед «Участник 10». */
+    private static int compareNames(String a, String b) {
+        int byPrefix = a.replaceAll("\\d+$", "").compareToIgnoreCase(b.replaceAll("\\d+$", ""));
+        if (byPrefix != 0) {
+            return byPrefix;
+        }
+        int byNumber = Long.compare(trailingNumber(a), trailingNumber(b));
+        return byNumber != 0 ? byNumber : a.compareTo(b);
+    }
+
+    private static final Pattern TRAILING_NUMBER = Pattern.compile("(\\d+)$");
+
+    private static long trailingNumber(String s) {
+        Matcher m = TRAILING_NUMBER.matcher(s);
+        if (!m.find()) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+            return Long.MAX_VALUE;
+        }
     }
 
     // ---------- Клиенты ----------
@@ -459,6 +772,7 @@ public class ServerMain {
                 delivered++;
             }
         }
-        System.out.println("Рассылка (получателей: " + delivered + "): " + json);
+        String shown = json.length() > 200 ? json.substring(0, 200) + "… (" + json.length() + " симв.)" : json;
+        System.out.println("Рассылка (получателей: " + delivered + "): " + shown);
     }
 }

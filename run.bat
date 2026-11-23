@@ -13,6 +13,6 @@ start "Voting Host" "%JAVA%" -jar "%CLIENT_JAR%" --host
 
 timeout /t 1 /nobreak >nul
 
-start "Voting Client 1" "%JAVA%" -jar "%CLIENT_JAR%"
-start "Voting Client 2" "%JAVA%" -jar "%CLIENT_JAR%"
-start "Voting Client 3" "%JAVA%" -jar "%CLIENT_JAR%"
+start "Voting Client 1" "%JAVA%" -jar "%CLIENT_JAR%" "--name=Участник 1"
+start "Voting Client 2" "%JAVA%" -jar "%CLIENT_JAR%" "--name=Участник 2"
+start "Voting Client 3" "%JAVA%" -jar "%CLIENT_JAR%" "--name=Участник 3"

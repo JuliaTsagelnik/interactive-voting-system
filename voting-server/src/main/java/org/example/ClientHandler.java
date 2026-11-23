@@ -1,3 +1,4 @@
+// ClientHandler.java
 package org.example;
 
 import com.google.gson.Gson;
@@ -16,12 +17,15 @@ import java.sql.SQLException;
 public class ClientHandler implements Runnable {
     private static final String ROLE_HOST = "host";
     private static final String ROLE_CLIENT = "client";
+    private static final String HOST_NAME = "Ведущий";
 
-    private record Request(String action, String role, String clientId,
+    private record Request(String action, String role, String clientId, String displayName,
                            Integer pollId, Integer questionIndex,
                            Integer questionId, Integer optionId) {}
 
     private record StatusResponse(String type, String code, String message, Integer questionId) {}
+
+    private enum VoteResult { ACCEPTED, ALREADY_VOTED, NOT_ACTIVE, FAILED }
 
     private final Socket socket;
     private final Connection db;
@@ -58,7 +62,8 @@ public class ClientHandler implements Runnable {
             if (session != null) {
                 ServerMain.removeSession(session);
             }
-            System.out.println("[" + name + "] Клиент отключен (" + (session != null ? session.role() : "?") + ")");
+            String who = session != null && session.displayName() != null ? session.displayName() : "?";
+            System.out.println("[" + name + "] Клиент отключен (" + who + ")");
         }
     }
 
@@ -87,6 +92,7 @@ public class ClientHandler implements Runnable {
         switch (request.action()) {
             case "host_open_poll" -> handleOpenPoll(request);
             case "host_set_question" -> handleSetQuestion(request);
+            case "host_finish_poll" -> handleFinishPoll();
             case "host_close_poll" -> handleClosePoll();
             case "vote" -> handleVote(request);
             default -> sendStatus("error", "unknown_action", "Неизвестное действие: " + request.action(), null);
@@ -107,11 +113,15 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        session.setIdentity(role, clientId);
+        String displayName = ROLE_HOST.equals(role)
+                ? HOST_NAME
+                : ServerMain.registerName(clientId, request.displayName());
+        session.setIdentity(role, clientId, displayName);
 
         if (ROLE_HOST.equals(role)) {
             session.send(ServerMain.catalogJson());
         }
+        // Новому клиенту приходит waiting, active_question или poll_summary, если опрос уже завершён
         session.send(ServerMain.currentStateJson());
     }
 
@@ -152,6 +162,22 @@ public class ClientHandler implements Runnable {
         }
     }
 
+    private void handleFinishPoll() {
+        if (!requireHost()) {
+            return;
+        }
+        try {
+            switch (ServerMain.finishPoll()) {
+                case OK -> { }
+                case NO_ACTIVE_POLL -> sendStatus("error", "no_active_poll", "Нет открытого опроса", null);
+                case ALREADY_FINISHED -> sendStatus("error", "already_finished", "Опрос уже завершён", null);
+            }
+        } catch (SQLException e) {
+            System.err.println("Ошибка формирования итогов: " + e.getMessage());
+            sendStatus("error", "db_error", "Не удалось сформировать итоги опроса", null);
+        }
+    }
+
     private void handleClosePoll() {
         if (!requireHost()) {
             return;
@@ -179,7 +205,11 @@ public class ClientHandler implements Runnable {
 
         Integer activeId = ServerMain.activeQuestionId();
         if (activeId == null) {
-            sendStatus("error", "no_active_poll", "Сейчас нет открытого опроса", questionId);
+            if (ServerMain.isPollFinished()) {
+                sendStatus("error", "poll_finished", "Опрос завершён, приём голосов закрыт", questionId);
+            } else {
+                sendStatus("error", "no_active_poll", "Сейчас нет открытого опроса", questionId);
+            }
             return;
         }
         if (activeId != questionId) {
@@ -191,42 +221,54 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        boolean accepted;
+        VoteResult result;
         try {
-            accepted = saveVote(clientId, questionId, optionId);
+            result = saveVote(clientId, questionId, optionId);
         } catch (SQLException e) {
             System.err.println("Ошибка записи голоса в БД: " + e.getMessage());
             sendStatus("error", "db_error", "Ошибка сервера при сохранении голоса", questionId);
             return;
         }
 
-        if (!accepted) {
-            System.out.println("Клиент " + clientId + " уже голосовал в вопросе " + questionId);
-            sendStatus("error", "already_voted", "Вы уже голосовали в этом вопросе", questionId);
-            return;
+        switch (result) {
+            case ACCEPTED -> {
+                sendStatus("vote_ok", null, "Ваш голос учтён", questionId);
+                ServerMain.voteAccepted(optionId);
+            }
+            case ALREADY_VOTED -> {
+                System.out.println("Клиент " + clientId + " уже голосовал в вопросе " + questionId);
+                sendStatus("error", "already_voted", "Вы уже голосовали в этом вопросе", questionId);
+            }
+            case NOT_ACTIVE -> sendStatus("error", "question_not_active",
+                    "Вопрос уже не активен или опрос завершён", questionId);
+            case FAILED -> sendStatus("error", "bad_option", "Не удалось сохранить голос", questionId);
         }
-
-        sendStatus("vote_ok", null, "Ваш голос учтён", questionId);
-        ServerMain.voteAccepted(optionId);
     }
 
     /**
-     * Регистрирует избирателя и увеличивает счётчик варианта в одной транзакции.
+     * Регистрирует избирателя вместе с выбранным вариантом и увеличивает счётчик в одной транзакции.
+     * Активность вопроса перепроверяется под замком БД: finishPoll закрывает приём голосов под тем же замком,
+     * поэтому после чтения итогов новые голоса в базу не попадут.
      * INSERT OR IGNORE вернёт 0 строк, если пара (client_id, question_id) уже есть.
-     * Соединение SQLite общее, поэтому доступ к нему сериализован.
      */
-    private boolean saveVote(String clientId, int questionId, int optionId) throws SQLException {
+    private VoteResult saveVote(String clientId, int questionId, int optionId) throws SQLException {
         synchronized (db) {
+            Integer activeId = ServerMain.activeQuestionId();
+            if (activeId == null || activeId != questionId) {
+                return VoteResult.NOT_ACTIVE;
+            }
+
             boolean previousAutoCommit = db.getAutoCommit();
             db.setAutoCommit(false);
             try {
                 try (PreparedStatement insert = db.prepareStatement(
-                        "INSERT OR IGNORE INTO voters (client_id, question_id) VALUES (?, ?)")) {
+                        "INSERT OR IGNORE INTO voters (client_id, question_id, option_id) VALUES (?, ?, ?)")) {
                     insert.setString(1, clientId);
                     insert.setInt(2, questionId);
+                    insert.setInt(3, optionId);
                     if (insert.executeUpdate() == 0) {
                         db.rollback();
-                        return false;
+                        return VoteResult.ALREADY_VOTED;
                     }
                 }
 
@@ -236,12 +278,12 @@ public class ClientHandler implements Runnable {
                     update.setInt(2, questionId);
                     if (update.executeUpdate() != 1) {
                         db.rollback();
-                        return false;
+                        return VoteResult.FAILED;
                     }
                 }
 
                 db.commit();
-                return true;
+                return VoteResult.ACCEPTED;
             } catch (SQLException e) {
                 db.rollback();
                 throw e;
