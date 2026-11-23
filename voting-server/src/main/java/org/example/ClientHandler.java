@@ -25,13 +25,15 @@ public class ClientHandler implements Runnable {
 
     private record StatusResponse(String type, String code, String message, Integer questionId) {}
 
-    private enum VoteResult { ACCEPTED, ALREADY_VOTED, NOT_ACTIVE, FAILED }
+    private enum VoteResult { ACCEPTED, ALREADY_VOTED, REJECTED, FAILED }
 
     private final Socket socket;
     private final Connection db;
     private final Gson gson = new Gson();
 
     private ServerMain.ClientSession session;
+    // Причина отказа, если saveVote вернул REJECTED (поле используется только потоком этого клиента)
+    private ServerMain.VoteGate rejectedGate;
 
     public ClientHandler(Socket socket, Connection db) {
         this.socket = socket;
@@ -203,17 +205,9 @@ public class ClientHandler implements Runnable {
         int questionId = request.questionId();
         int optionId = request.optionId();
 
-        Integer activeId = ServerMain.activeQuestionId();
-        if (activeId == null) {
-            if (ServerMain.isPollFinished()) {
-                sendStatus("error", "poll_finished", "Опрос завершён, приём голосов закрыт", questionId);
-            } else {
-                sendStatus("error", "no_active_poll", "Сейчас нет открытого опроса", questionId);
-            }
-            return;
-        }
-        if (activeId != questionId) {
-            sendStatus("error", "question_not_active", "Этот вопрос сейчас не активен", questionId);
+        ServerMain.VoteGate gate = ServerMain.voteGate(questionId);
+        if (gate != ServerMain.VoteGate.OPEN) {
+            sendGateError(gate, questionId);
             return;
         }
         if (!ServerMain.hasOption(questionId, optionId)) {
@@ -233,29 +227,42 @@ public class ClientHandler implements Runnable {
         switch (result) {
             case ACCEPTED -> {
                 sendStatus("vote_ok", null, "Ваш голос учтён", questionId);
-                ServerMain.voteAccepted(optionId);
+                ServerMain.voteAccepted(questionId, optionId);
             }
             case ALREADY_VOTED -> {
                 System.out.println("Клиент " + clientId + " уже голосовал в вопросе " + questionId);
                 sendStatus("error", "already_voted", "Вы уже голосовали в этом вопросе", questionId);
             }
-            case NOT_ACTIVE -> sendStatus("error", "question_not_active",
-                    "Вопрос уже не активен или опрос завершён", questionId);
+            case REJECTED -> sendGateError(rejectedGate, questionId);
             case FAILED -> sendStatus("error", "bad_option", "Не удалось сохранить голос", questionId);
+        }
+    }
+
+    private void sendGateError(ServerMain.VoteGate gate, int questionId) {
+        switch (gate) {
+            case NO_POLL -> sendStatus("error", "no_active_poll", "Сейчас нет открытого опроса", questionId);
+            case FINISHED -> sendStatus("error", "poll_finished",
+                    "Опрос завершён, приём голосов закрыт", questionId);
+            case WRONG_QUESTION -> sendStatus("error", "question_not_active",
+                    "Этот вопрос сейчас не активен", questionId);
+            case CLOSED -> sendStatus("error", "question_closed",
+                    "Время вышло, приём ответов на этот вопрос закрыт", questionId);
+            case OPEN -> sendStatus("error", "question_not_active", "Не удалось принять голос", questionId);
         }
     }
 
     /**
      * Регистрирует избирателя вместе с выбранным вариантом и увеличивает счётчик в одной транзакции.
-     * Активность вопроса перепроверяется под замком БД: finishPoll закрывает приём голосов под тем же замком,
-     * поэтому после чтения итогов новые голоса в базу не попадут.
+     * Допустимость голоса перепроверяется под замком БД: finishPoll и раскрытие ответа ставят свои метки
+     * под тем же замком, поэтому после закрытия вопроса новые голоса в базу не попадут.
      * INSERT OR IGNORE вернёт 0 строк, если пара (client_id, question_id) уже есть.
      */
     private VoteResult saveVote(String clientId, int questionId, int optionId) throws SQLException {
         synchronized (db) {
-            Integer activeId = ServerMain.activeQuestionId();
-            if (activeId == null || activeId != questionId) {
-                return VoteResult.NOT_ACTIVE;
+            ServerMain.VoteGate gate = ServerMain.voteGate(questionId);
+            if (gate != ServerMain.VoteGate.OPEN) {
+                rejectedGate = gate;
+                return VoteResult.REJECTED;
             }
 
             boolean previousAutoCommit = db.getAutoCommit();

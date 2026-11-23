@@ -28,6 +28,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -37,42 +40,86 @@ public class ServerMain {
     private static final String DB_URL = "jdbc:sqlite:voting.db";
     private static final String POLLS_RESOURCE = "/polls.json";
     private static final int MAX_NAME_LENGTH = 40;
+    private static final int DEFAULT_TIME_LIMIT = 10;
+    private static final String MODE_POLL = "poll";
+    private static final String MODE_QUIZ = "quiz";
 
     // ---------- Формат polls.json ----------
 
-    public record SeedQuestion(String text, List<String> options) {}
-    /** profiles необязательно: ключи option1, option2, option3, mixed. */
-    public record SeedPoll(String title, List<SeedQuestion> questions, Map<String, String> profiles) {}
+    /** correctIndex нужен только для викторин (0, 1 или 2). */
+    public record SeedQuestion(String text, List<String> options, Integer correctIndex) {}
+    /** profiles, mode и timeLimitSeconds необязательны. */
+    public record SeedPoll(String title, List<SeedQuestion> questions, Map<String, String> profiles,
+                           String mode, Integer timeLimitSeconds) {}
     public record SeedTheme(String theme, List<SeedPoll> polls) {}
 
     // ---------- Форматы ответов сервера ----------
 
-    public record CatalogPoll(int id, String title, int questionCount) {}
+    public record CatalogPoll(int id, String title, int questionCount, String mode) {}
     public record CatalogTheme(int id, String title, List<CatalogPoll> polls) {}
     public record CatalogResponse(String type, List<CatalogTheme> themes) {}
     public record WaitingResponse(String type) {}
     public record OptionResult(int id, String text, int votes) {}
+    /**
+     * correctOptionId заполняется только при revealed == true, до этого поле не сериализуется.
+     * secondsLeft и correctOptionId для обычных опросов тоже отсутствуют.
+     */
     public record ActiveQuestionResponse(String type, int pollId, String theme, String pollTitle,
                                          int questionId, int questionIndex, int totalQuestions,
-                                         String text, List<OptionResult> options) {}
+                                         String text, List<OptionResult> options,
+                                         String mode, boolean revealed, Integer secondsLeft,
+                                         Integer correctOptionId) {}
+    public record TimerTick(String type, int questionId, int secondsLeft) {}
 
     // Итоги опроса (orderNum и questionNumber нумеруются с единицы)
     public record SummaryOption(int id, String text, int votes) {}
-    public record SummaryQuestion(int orderNum, String text, int totalVotes, List<SummaryOption> options) {}
-    public record SummaryAnswer(int questionNumber, String questionText, String optionText) {}
+    public record SummaryQuestion(int orderNum, String text, int totalVotes, List<SummaryOption> options,
+                                  Integer correctOptionId, String correctOptionText) {}
+    public record SummaryAnswer(int questionNumber, String questionText, String optionText,
+                                Boolean correct, String correctOptionText) {}
     public record SummaryParticipant(String clientId, String displayName, int answeredCount, int totalQuestions,
                                      List<Integer> optionIndexCounts, int majorityMatchPercent,
-                                     String verdict, List<SummaryAnswer> answers) {}
-    public record PollSummaryResponse(String type, int pollId, String theme, String pollTitle,
+                                     String verdict, List<SummaryAnswer> answers,
+                                     Integer correctCount, Integer grade10) {}
+    public record PollSummaryResponse(String type, int pollId, String theme, String pollTitle, String mode,
                                       List<SummaryQuestion> questions, List<SummaryParticipant> participants) {}
 
     public enum FinishResult { OK, NO_ACTIVE_POLL, ALREADY_FINISHED }
 
+    /** Можно ли сейчас принимать голос по вопросу. */
+    public enum VoteGate { OPEN, NO_POLL, FINISHED, WRONG_QUESTION, CLOSED }
+
     // ---------- Данные в памяти (структура после загрузки не меняется, меняются только голоса) ----------
 
-    private record OptionData(int id, String text) {}
-    private record QuestionData(int id, int pollId, int orderNum, String text, List<OptionData> options) {}
-    private record PollData(int id, int themeId, String title, List<QuestionData> questions) {}
+    private record OptionData(int id, String text, boolean correct) {}
+
+    private record QuestionData(int id, int pollId, int orderNum, String text, List<OptionData> options) {
+        Integer correctOptionId() {
+            for (OptionData option : options) {
+                if (option.correct()) {
+                    return option.id();
+                }
+            }
+            return null;
+        }
+
+        String correctOptionText() {
+            for (OptionData option : options) {
+                if (option.correct()) {
+                    return option.text();
+                }
+            }
+            return null;
+        }
+    }
+
+    private record PollData(int id, int themeId, String title, String mode, int timeLimitSec,
+                            List<QuestionData> questions) {
+        boolean quiz() {
+            return MODE_QUIZ.equals(mode);
+        }
+    }
+
     private record ThemeData(int id, String title, List<PollData> polls) {}
 
     /**
@@ -96,6 +143,20 @@ public class ServerMain {
 
     private static volatile ActiveState active;
     private static Connection database;
+
+    // Раскрытые вопросы текущей сессии опроса. Меняется под замком класса и замком БД,
+    // читается без замков (из saveVote под замком БД).
+    private static final Set<Integer> revealedQuestions = ConcurrentHashMap.newKeySet();
+
+    // Таймер викторины. Поля ниже защищены замком класса.
+    private static final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "quiz-timer");
+        t.setDaemon(true);
+        return t;
+    });
+    private static ScheduledFuture<?> timerTask;
+    private static int timerGeneration;
+    private static int secondsLeft;
 
     /** Подключение клиента: поток вывода, роль, идентификатор и имя из hello. */
     public static final class ClientSession {
@@ -148,8 +209,9 @@ public class ServerMain {
             initDatabase(db);
             loadData(db);
             loadProfiles();
+            long quizzes = pollsById.values().stream().filter(PollData::quiz).count();
             System.out.println("База подключена. Тем: " + themes.size() + ", опросов: " + pollsById.size()
-                    + ", вопросов: " + questionsById.size()
+                    + " (викторин: " + quizzes + "), вопросов: " + questionsById.size()
                     + ", опросов с профилями: " + profilesByPollTitle.size());
 
             System.out.println("Сервер запущен, порт " + PORT + ". Ожидание подключений...");
@@ -163,6 +225,7 @@ public class ServerMain {
         } catch (IOException e) {
             System.err.println("Ошибка сервера: " + e.getMessage());
         } finally {
+            timer.shutdownNow();
             pool.shutdown();
         }
     }
@@ -184,9 +247,11 @@ public class ServerMain {
                     )""");
             st.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS polls (
-                        id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                        theme_id INTEGER NOT NULL,
-                        title    TEXT NOT NULL,
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        theme_id       INTEGER NOT NULL,
+                        title          TEXT NOT NULL,
+                        mode           TEXT NOT NULL DEFAULT 'poll',
+                        time_limit_sec INTEGER NOT NULL DEFAULT 10,
                         FOREIGN KEY (theme_id) REFERENCES themes(id)
                     )""");
             st.executeUpdate("""
@@ -203,6 +268,7 @@ public class ServerMain {
                         question_id INTEGER NOT NULL,
                         text        TEXT NOT NULL,
                         votes       INTEGER NOT NULL DEFAULT 0,
+                        is_correct  INTEGER NOT NULL DEFAULT 0,
                         FOREIGN KEY (question_id) REFERENCES questions(id)
                     )""");
             st.executeUpdate("""
@@ -231,9 +297,9 @@ public class ServerMain {
     private static void dropLegacyTables(Connection db) throws SQLException {
         Map<String, Set<String>> expected = Map.of(
                 "themes", Set.of("id", "title"),
-                "polls", Set.of("id", "theme_id", "title"),
+                "polls", Set.of("id", "theme_id", "title", "mode", "time_limit_sec"),
                 "questions", Set.of("id", "poll_id", "order_num", "text"),
-                "options", Set.of("id", "question_id", "text", "votes"),
+                "options", Set.of("id", "question_id", "text", "votes", "is_correct"),
                 "voters", Set.of("client_id", "question_id", "option_id"));
 
         boolean incompatible = false;
@@ -283,6 +349,10 @@ public class ServerMain {
         }
     }
 
+    private static String normalizeMode(String mode) {
+        return MODE_QUIZ.equalsIgnoreCase(mode == null ? "" : mode.trim()) ? MODE_QUIZ : MODE_POLL;
+    }
+
     private static void seedFromResource(Connection db) throws SQLException, IOException {
         SeedTheme[] seed = readSeed();
 
@@ -291,17 +361,35 @@ public class ServerMain {
             for (SeedTheme theme : seed) {
                 int themeId = insertReturningId(db, "INSERT INTO themes (title) VALUES (?)", theme.theme());
                 for (SeedPoll poll : theme.polls()) {
+                    String mode = normalizeMode(poll.mode());
+                    boolean quiz = MODE_QUIZ.equals(mode);
+                    int limit = poll.timeLimitSeconds() != null && poll.timeLimitSeconds() > 0
+                            ? poll.timeLimitSeconds() : DEFAULT_TIME_LIMIT;
+
                     int pollId = insertReturningId(db,
-                            "INSERT INTO polls (theme_id, title) VALUES (?, ?)", themeId, poll.title());
+                            "INSERT INTO polls (theme_id, title, mode, time_limit_sec) VALUES (?, ?, ?, ?)",
+                            themeId, poll.title(), mode, limit);
                     int order = 0;
                     for (SeedQuestion question : poll.questions()) {
                         int questionId = insertReturningId(db,
                                 "INSERT INTO questions (poll_id, order_num, text) VALUES (?, ?, ?)",
                                 pollId, order++, question.text());
+
+                        Integer correctIndex = question.correctIndex();
+                        if (quiz && (correctIndex == null || correctIndex < 0
+                                || correctIndex >= question.options().size())) {
+                            System.err.println("Предупреждение: у вопроса викторины «" + question.text()
+                                    + "» не задан корректный correctIndex, правильного ответа не будет");
+                            correctIndex = null;
+                        }
+
+                        int index = 0;
                         for (String option : question.options()) {
+                            boolean correct = quiz && correctIndex != null && correctIndex == index;
                             insertReturningId(db,
-                                    "INSERT INTO options (question_id, text, votes) VALUES (?, ?, 0)",
-                                    questionId, option);
+                                    "INSERT INTO options (question_id, text, votes, is_correct) VALUES (?, ?, 0, ?)",
+                                    questionId, option, correct ? 1 : 0);
+                            index++;
                         }
                     }
                 }
@@ -332,11 +420,12 @@ public class ServerMain {
     private static void loadData(Connection db) throws SQLException {
         Map<Integer, List<OptionData>> optionsByQuestion = new HashMap<>();
         try (Statement st = db.createStatement();
-             ResultSet rs = st.executeQuery("SELECT id, question_id, text, votes FROM options ORDER BY id")) {
+             ResultSet rs = st.executeQuery(
+                     "SELECT id, question_id, text, votes, is_correct FROM options ORDER BY id")) {
             while (rs.next()) {
                 int id = rs.getInt("id");
                 optionsByQuestion.computeIfAbsent(rs.getInt("question_id"), k -> new ArrayList<>())
-                        .add(new OptionData(id, rs.getString("text")));
+                        .add(new OptionData(id, rs.getString("text"), rs.getInt("is_correct") == 1));
                 optionVotes.put(id, rs.getInt("votes"));
             }
         }
@@ -357,11 +446,13 @@ public class ServerMain {
 
         Map<Integer, List<PollData>> pollsByTheme = new HashMap<>();
         try (Statement st = db.createStatement();
-             ResultSet rs = st.executeQuery("SELECT id, theme_id, title FROM polls ORDER BY id")) {
+             ResultSet rs = st.executeQuery(
+                     "SELECT id, theme_id, title, mode, time_limit_sec FROM polls ORDER BY id")) {
             while (rs.next()) {
                 int id = rs.getInt("id");
                 int themeId = rs.getInt("theme_id");
                 PollData poll = new PollData(id, themeId, rs.getString("title"),
+                        normalizeMode(rs.getString("mode")), rs.getInt("time_limit_sec"),
                         List.copyOf(questionsByPoll.getOrDefault(id, List.of())));
                 pollsByTheme.computeIfAbsent(themeId, k -> new ArrayList<>()).add(poll);
                 pollsById.put(id, poll);
@@ -423,7 +514,7 @@ public class ServerMain {
         for (ThemeData theme : themes) {
             List<CatalogPoll> polls = new ArrayList<>();
             for (PollData poll : theme.polls()) {
-                polls.add(new CatalogPoll(poll.id(), poll.title(), poll.questions().size()));
+                polls.add(new CatalogPoll(poll.id(), poll.title(), poll.questions().size(), poll.mode()));
             }
             result.add(new CatalogTheme(theme.id(), theme.title(), polls));
         }
@@ -436,7 +527,7 @@ public class ServerMain {
 
     /**
      * JSON текущего состояния: waiting, active_question или poll_summary.
-     * Метод синхронизирован, чтобы не отдать состояние в середине finishPoll.
+     * Метод синхронизирован, чтобы не отдать состояние в середине finishPoll или смены вопроса.
      */
     public static synchronized String currentStateJson() {
         ActiveState state = active;
@@ -453,27 +544,47 @@ public class ServerMain {
         for (OptionData option : question.options()) {
             options.add(new OptionResult(option.id(), option.text(), optionVotes.getOrDefault(option.id(), 0)));
         }
+
+        boolean quiz = poll.quiz();
+        boolean revealed = quiz && revealedQuestions.contains(question.id());
+        Integer seconds = null;
+        if (quiz) {
+            if (revealed) {
+                seconds = 0;
+            } else if (timerTask != null) {
+                seconds = secondsLeft;
+            }
+        }
+        // Правильный ответ уходит клиентам только после раскрытия
+        Integer correctOptionId = revealed ? question.correctOptionId() : null;
+
         return gson.toJson(new ActiveQuestionResponse("active_question", poll.id(),
                 themeTitles.get(poll.themeId()), poll.title(), question.id(), state.questionIndex(),
-                poll.questions().size(), question.text(), options));
+                poll.questions().size(), question.text(), options,
+                poll.mode(), revealed, seconds, correctOptionId));
     }
 
     /**
-     * Id текущего вопроса или null, если опрос не открыт либо завершён.
-     * Намеренно не synchronized: вызывается из ClientHandler под замком БД,
-     * а finishPoll берёт замки в обратном порядке.
+     * Можно ли принять голос по вопросу. Намеренно не synchronized: вызывается из ClientHandler
+     * под замком БД, а finishPoll и reveal берут замки в обратном порядке (класс, затем БД).
      */
-    public static Integer activeQuestionId() {
+    public static VoteGate voteGate(int questionId) {
         ActiveState state = active;
-        if (state == null || state.finished()) {
-            return null;
+        if (state == null) {
+            return VoteGate.NO_POLL;
         }
-        return pollsById.get(state.pollId()).questions().get(state.questionIndex()).id();
-    }
-
-    public static boolean isPollFinished() {
-        ActiveState state = active;
-        return state != null && state.finished();
+        if (state.finished()) {
+            return VoteGate.FINISHED;
+        }
+        PollData poll = pollsById.get(state.pollId());
+        QuestionData current = poll.questions().get(state.questionIndex());
+        if (current.id() != questionId) {
+            return VoteGate.WRONG_QUESTION;
+        }
+        if (poll.quiz() && revealedQuestions.contains(questionId)) {
+            return VoteGate.CLOSED;
+        }
+        return VoteGate.OPEN;
     }
 
     public static boolean hasOption(int questionId, int optionId) {
@@ -496,8 +607,12 @@ public class ServerMain {
         if (poll == null || poll.questions().isEmpty()) {
             return false;
         }
-        active = new ActiveState(pollId, 0, false, null);
-        broadcastState();
+        cancelTimer();
+        synchronized (database) {
+            revealedQuestions.clear();
+            active = new ActiveState(pollId, 0, false, null);
+        }
+        enterQuestion();
         return true;
     }
 
@@ -510,12 +625,14 @@ public class ServerMain {
         if (questionIndex < 0 || questionIndex >= total) {
             return false;
         }
+        cancelTimer();
         active = new ActiveState(state.pollId(), questionIndex, false, null);
-        broadcastState();
+        enterQuestion();
         return true;
     }
 
     public static synchronized void closePoll() {
+        cancelTimer();
         active = null;
         broadcastState();
     }
@@ -547,17 +664,164 @@ public class ServerMain {
             }
         }
 
+        cancelTimer();
         active = new ActiveState(state.pollId(), state.questionIndex(), true, summaryJson);
         broadcastState();
         return FinishResult.OK;
     }
 
-    /** Учитывает принятый (уже записанный в БД) голос в памяти и рассылает новое состояние. */
-    public static synchronized void voteAccepted(int optionId) {
+    /**
+     * Учитывает принятый (уже записанный в БД) голос в памяти. В викторине проверяет досрочное
+     * раскрытие (проголосовали все подключённые участники), иначе рассылает новое состояние.
+     */
+    public static synchronized void voteAccepted(int questionId, int optionId) {
         optionVotes.merge(optionId, 1, Integer::sum);
         ActiveState state = active;
-        if (state != null && !state.finished()) {
+        if (state == null || state.finished()) {
+            return;
+        }
+        if (isRunningQuizQuestion(questionId) && allConnectedVoted(questionId)) {
+            reveal();
+        } else {
             broadcastState();
+        }
+    }
+
+    // ---------- Таймер и раскрытие ответа (всё ниже вызывается под замком класса) ----------
+
+    /** Входит в текущий вопрос: для ещё не раскрытого вопроса викторины запускает отсчёт. */
+    private static synchronized void enterQuestion() {
+        ActiveState state = active;
+        PollData poll = pollsById.get(state.pollId());
+        QuestionData question = poll.questions().get(state.questionIndex());
+
+        if (poll.quiz() && !revealedQuestions.contains(question.id())) {
+            startTimer(poll.timeLimitSec());
+            // Случай повторного запуска: все подключённые уже отвечали на этот вопрос раньше
+            if (allConnectedVoted(question.id())) {
+                reveal();
+                return;
+            }
+        }
+        broadcastState();
+    }
+
+    private static synchronized void startTimer(int seconds) {
+        cancelTimer();
+        int generation = timerGeneration;
+        int questionId = currentQuestionId();
+        secondsLeft = seconds;
+        timerTask = timer.scheduleAtFixedRate(() -> {
+            try {
+                onTick(generation, questionId);
+            } catch (RuntimeException e) {
+                // Необработанное исключение остановило бы периодическую задачу без следа
+                System.err.println("Ошибка таймера: " + e.getMessage());
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    private static synchronized void cancelTimer() {
+        if (timerTask != null) {
+            timerTask.cancel(false);
+            timerTask = null;
+        }
+        // Уже запущенный тик дождётся замка и увидит, что поколение сменилось
+        timerGeneration++;
+    }
+
+    private static synchronized void onTick(int generation, int questionId) {
+        if (generation != timerGeneration || timerTask == null) {
+            return;
+        }
+        ActiveState state = active;
+        if (state == null || state.finished()) {
+            return;
+        }
+        if (secondsLeft > 0) {
+            secondsLeft--;
+        }
+        if (secondsLeft > 0) {
+            broadcastRaw(gson.toJson(new TimerTick("timer_tick", questionId, secondsLeft)));
+        } else {
+            reveal();
+        }
+    }
+
+    /**
+     * Раскрывает ответ на текущий вопрос: отменяет таймер, закрывает приём голосов
+     * и рассылает active_question с revealed = true. Метку ставим под замком БД,
+     * чтобы saveVote, уже державший замок, успел дописать свой голос до закрытия.
+     */
+    private static synchronized void reveal() {
+        ActiveState state = active;
+        if (state == null || state.finished()) {
+            return;
+        }
+        int questionId = currentQuestionId();
+        cancelTimer();
+        synchronized (database) {
+            revealedQuestions.add(questionId);
+        }
+        broadcastState();
+    }
+
+    private static int currentQuestionId() {
+        ActiveState state = active;
+        return pollsById.get(state.pollId()).questions().get(state.questionIndex()).id();
+    }
+
+    private static boolean isRunningQuizQuestion(int questionId) {
+        ActiveState state = active;
+        if (state == null || state.finished()) {
+            return false;
+        }
+        PollData poll = pollsById.get(state.pollId());
+        return poll.quiz()
+                && currentQuestionId() == questionId
+                && !revealedQuestions.contains(questionId)
+                && timerTask != null;
+    }
+
+    /** true, если подключённых участников больше нуля и каждый уже есть в voters по этому вопросу. */
+    private static boolean allConnectedVoted(int questionId) {
+        Set<String> connected = new HashSet<>();
+        for (ClientSession session : sessions) {
+            if ("client".equals(session.role()) && session.clientId() != null) {
+                connected.add(session.clientId());
+            }
+        }
+        if (connected.isEmpty() || database == null) {
+            return false;
+        }
+
+        Set<String> voted = new HashSet<>();
+        synchronized (database) {
+            try (PreparedStatement ps = database.prepareStatement(
+                    "SELECT client_id FROM voters WHERE question_id = ?")) {
+                ps.setInt(1, questionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        voted.add(rs.getString(1));
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("Ошибка проверки голосов: " + e.getMessage());
+                return false;
+            }
+        }
+        return voted.containsAll(connected);
+    }
+
+    /** После отключения участника оставшиеся могли оказаться все проголосовавшими. */
+    private static synchronized void checkEarlyReveal() {
+        ActiveState state = active;
+        if (state == null || state.finished()) {
+            return;
+        }
+        int questionId = currentQuestionId();
+        if (isRunningQuizQuestion(questionId) && allConnectedVoted(questionId)) {
+            reveal();
         }
     }
 
@@ -565,6 +829,8 @@ public class ServerMain {
 
     /** Вызывается под замком БД. */
     private static PollSummaryResponse buildSummary(PollData poll) throws SQLException {
+        boolean quiz = poll.quiz();
+
         // clientId -> (questionId -> optionId), в порядке первого появления
         Map<String, Map<Integer, Integer>> answersByClient = new LinkedHashMap<>();
         // optionId -> число голосов в рамках этого опроса
@@ -587,6 +853,15 @@ public class ServerMain {
             }
         }
 
+        // В викторине в рейтинг попадают и подключённые участники без единого ответа
+        if (quiz) {
+            for (ClientSession session : sessions) {
+                if ("client".equals(session.role()) && session.clientId() != null) {
+                    answersByClient.putIfAbsent(session.clientId(), new HashMap<>());
+                }
+            }
+        }
+
         int maxOptions = 0;
         List<SummaryQuestion> summaryQuestions = new ArrayList<>();
         Map<Integer, Integer> leaderVotes = new HashMap<>(); // questionId -> максимум голосов
@@ -605,7 +880,9 @@ public class ServerMain {
                 max = Math.max(max, votes);
             }
             leaderVotes.put(question.id(), max);
-            summaryQuestions.add(new SummaryQuestion(number, question.text(), total, options));
+            summaryQuestions.add(new SummaryQuestion(number, question.text(), total, options,
+                    quiz ? question.correctOptionId() : null,
+                    quiz ? question.correctOptionText() : null));
         }
 
         List<SummaryParticipant> participants = new ArrayList<>();
@@ -616,39 +893,69 @@ public class ServerMain {
                 participants.add(participant);
             }
         }
-        participants.sort((a, b) -> compareNames(a.displayName(), b.displayName()));
+
+        if (quiz) {
+            participants.sort((a, b) -> {
+                int byScore = Integer.compare(b.correctCount(), a.correctCount());
+                return byScore != 0 ? byScore : compareNames(a.displayName(), b.displayName());
+            });
+        } else {
+            participants.sort((a, b) -> compareNames(a.displayName(), b.displayName()));
+        }
 
         return new PollSummaryResponse("poll_summary", poll.id(), themeTitles.get(poll.themeId()),
-                poll.title(), summaryQuestions, participants);
+                poll.title(), poll.mode(), summaryQuestions, participants);
     }
 
     private static SummaryParticipant buildParticipant(PollData poll, String clientId,
                                                        Map<Integer, Integer> chosen, int maxOptions,
                                                        Map<Integer, Integer> optionCounts,
                                                        Map<Integer, Integer> leaderVotes) {
+        boolean quiz = poll.quiz();
         int[] indexCounts = new int[maxOptions];
         List<SummaryAnswer> answers = new ArrayList<>();
         int matches = 0;
+        int answered = 0;
+        int correctCount = 0;
 
         int number = 0;
         for (QuestionData question : poll.questions()) {
             number++;
             Integer optionId = chosen.get(question.id());
-            if (optionId == null) {
-                continue;
-            }
             int index = -1;
-            for (int i = 0; i < question.options().size(); i++) {
-                if (question.options().get(i).id() == optionId) {
-                    index = i;
-                    break;
+            if (optionId != null) {
+                for (int i = 0; i < question.options().size(); i++) {
+                    if (question.options().get(i).id() == optionId) {
+                        index = i;
+                        break;
+                    }
                 }
             }
+
             if (index < 0) {
+                if (quiz) {
+                    answers.add(new SummaryAnswer(number, question.text(), "Нет ответа",
+                            false, question.correctOptionText()));
+                }
                 continue;
             }
+
             indexCounts[index]++;
-            answers.add(new SummaryAnswer(number, question.text(), question.options().get(index).text()));
+            answered++;
+
+            Boolean correct = null;
+            String correctText = null;
+            if (quiz) {
+                Integer correctId = question.correctOptionId();
+                boolean isCorrect = correctId != null && correctId.intValue() == optionId;
+                if (isCorrect) {
+                    correctCount++;
+                }
+                correct = isCorrect;
+                correctText = question.correctOptionText();
+            }
+            answers.add(new SummaryAnswer(number, question.text(), question.options().get(index).text(),
+                    correct, correctText));
 
             // Совпадение с большинством: у выбранного варианта максимум голосов в вопросе (при ничьей совпадают все лидеры)
             int max = leaderVotes.getOrDefault(question.id(), 0);
@@ -657,11 +964,24 @@ public class ServerMain {
             }
         }
 
-        int answered = answers.size();
-        if (answered == 0) {
+        if (answered == 0 && !quiz) {
             return null;
         }
-        int matchPercent = (int) Math.round(matches * 100.0 / answered);
+        int matchPercent = answered == 0 ? 0 : (int) Math.round(matches * 100.0 / answered);
+
+        List<Integer> counts = new ArrayList<>();
+        for (int count : indexCounts) {
+            counts.add(count);
+        }
+        String name = clientNames.getOrDefault(clientId, "Участник");
+        int totalQuestions = poll.questions().size();
+
+        if (quiz) {
+            int grade10 = totalQuestions == 0 ? 0 : (int) Math.round(correctCount * 10.0 / totalQuestions);
+            String verdict = buildQuizVerdict(correctCount, totalQuestions, grade10, answered);
+            return new SummaryParticipant(clientId, name, answered, totalQuestions, counts,
+                    matchPercent, verdict, answers, correctCount, grade10);
+        }
 
         int best = 0;
         for (int count : indexCounts) {
@@ -678,14 +998,29 @@ public class ServerMain {
         boolean mixed = leaders != 1;
 
         String verdict = buildVerdict(poll, mixed ? -1 : bestIndex, best, answered, matchPercent);
+        return new SummaryParticipant(clientId, name, answered, totalQuestions, counts,
+                matchPercent, verdict, answers, null, null);
+    }
 
-        List<Integer> counts = new ArrayList<>();
-        for (int count : indexCounts) {
-            counts.add(count);
+    private static String buildQuizVerdict(int correct, int total, int grade10, int answered) {
+        String head = "Правильных ответов: " + correct + " из " + total + ", оценка " + grade10 + " из 10.";
+        if (answered == 0) {
+            return head + " Вы не ответили ни на один вопрос.";
         }
-        String name = clientNames.getOrDefault(clientId, "Участник");
-        return new SummaryParticipant(clientId, name, answered, poll.questions().size(), counts,
-                matchPercent, verdict, answers);
+        String tail;
+        if (grade10 >= 9) {
+            tail = " Почти без ошибок.";
+        } else if (grade10 >= 7) {
+            tail = " Уверенный результат, несколько вопросов стоит повторить.";
+        } else if (grade10 >= 4) {
+            tail = " Базу вы знаете, но пробелы заметны.";
+        } else {
+            tail = " Тема пока даётся с трудом, имеет смысл вернуться к материалу.";
+        }
+        if (answered < total) {
+            tail += " Без ответа осталось вопросов: " + (total - answered) + ".";
+        }
+        return head + tail;
     }
 
     /** dominantIndex = -1 означает смешанный тип (поровну между несколькими вариантами). */
@@ -752,6 +1087,20 @@ public class ServerMain {
 
     public static void removeSession(ClientSession session) {
         sessions.remove(session);
+        checkEarlyReveal();
+    }
+
+    /** Рассылка без записи в консоль (для ежесекундных тиков). */
+    private static synchronized void broadcastRaw(String json) {
+        for (ClientSession session : sessions) {
+            if (session.role() == null) {
+                continue;
+            }
+            session.send(json);
+            if (session.hasError()) {
+                sessions.remove(session);
+            }
+        }
     }
 
     /**

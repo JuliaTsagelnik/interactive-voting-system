@@ -39,8 +39,10 @@ import java.io.PrintWriter;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -56,10 +58,11 @@ public class ClientMain extends Application {
 
     // ---------- Ответы сервера ----------
 
-    private record CatalogPoll(int id, String title, int questionCount) {
+    private record CatalogPoll(int id, String title, int questionCount, String mode) {
         @Override
         public String toString() {
-            return title + " (вопросов: " + questionCount + ")";
+            String prefix = "quiz".equals(mode) ? "[Викторина] " : "";
+            return prefix + title + " (вопросов: " + questionCount + ")";
         }
     }
 
@@ -74,24 +77,59 @@ public class ClientMain extends Application {
     private record OptionResult(int id, String text, int votes) {}
     private record ActiveQuestion(String type, int pollId, String theme, String pollTitle,
                                   int questionId, int questionIndex, int totalQuestions,
-                                  String text, List<OptionResult> options) {}
+                                  String text, List<OptionResult> options,
+                                  String mode, boolean revealed, Integer secondsLeft,
+                                  Integer correctOptionId) {}
+    private record TimerTick(String type, int questionId, int secondsLeft) {}
     private record StatusMessage(String type, String code, String message, Integer questionId) {}
 
     private record SummaryOption(int id, String text, int votes) {}
-    private record SummaryQuestion(int orderNum, String text, int totalVotes, List<SummaryOption> options) {}
-    private record SummaryAnswer(int questionNumber, String questionText, String optionText) {}
+    private record SummaryQuestion(int orderNum, String text, int totalVotes, List<SummaryOption> options,
+                                   Integer correctOptionId, String correctOptionText) {}
+    private record SummaryAnswer(int questionNumber, String questionText, String optionText,
+                                 Boolean correct, String correctOptionText) {}
     private record SummaryParticipant(String clientId, String displayName, int answeredCount, int totalQuestions,
                                       List<Integer> optionIndexCounts, int majorityMatchPercent,
-                                      String verdict, List<SummaryAnswer> answers) {}
-    private record PollSummary(String type, int pollId, String theme, String pollTitle,
+                                      String verdict, List<SummaryAnswer> answers,
+                                      Integer correctCount, Integer grade10) {}
+    private record PollSummary(String type, int pollId, String theme, String pollTitle, String mode,
                                List<SummaryQuestion> questions, List<SummaryParticipant> participants) {}
 
     private static final String HOST = "localhost";
     private static final int PORT = 8080;
     private static final String NAME_ARG = "--name=";
+    private static final String MODE_QUIZ = "quiz";
+
     private static final String CARD_STYLE =
             "-fx-border-color: #c8c8c8; -fx-border-radius: 6; -fx-background-radius: 6; "
                     + "-fx-background-color: #fafafa; -fx-padding: 10;";
+
+    // Стили внешней рамки окна участника
+    private static final String BORDER_DEFAULT = "-fx-border-color: transparent; -fx-border-width: 6;";
+    private static final String BORDER_CORRECT = "-fx-border-color: #2ecc71; -fx-border-width: 6;";
+    private static final String BORDER_WRONG = "-fx-border-color: #e74c3c; -fx-border-width: 6;";
+
+    // Стили кнопок вариантов ответа
+    private static final String BTN_BASE =
+            "-fx-font-size: 13px; -fx-alignment: CENTER_LEFT; -fx-padding: 6 10 6 10;";
+    private static final String BTN_CHOSEN = BTN_BASE
+            + " -fx-border-color: #3498db; -fx-border-width: 2; -fx-border-radius: 4; -fx-background-radius: 4;";
+    private static final String BTN_CORRECT = BTN_BASE
+            + " -fx-background-color: #d4efdf; -fx-border-color: #27ae60; -fx-border-width: 2;"
+            + " -fx-border-radius: 4; -fx-background-radius: 4; -fx-text-fill: #145a32;"
+            + " -fx-font-weight: bold; -fx-opacity: 1.0;";
+    private static final String BTN_WRONG = BTN_BASE
+            + " -fx-background-color: #fadbd8; -fx-border-color: #e74c3c; -fx-border-width: 2;"
+            + " -fx-border-radius: 4; -fx-background-radius: 4; -fx-text-fill: #78281f;"
+            + " -fx-font-weight: bold; -fx-opacity: 1.0;";
+
+    // Стили строки статуса и таймера
+    private static final String STATUS_DEFAULT = "-fx-font-size: 13px; -fx-text-fill: #333333;";
+    private static final String STATUS_SUCCESS = "-fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: #27ae60;";
+    private static final String STATUS_ERROR = "-fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: #e74c3c;";
+    private static final String TIMER_NORMAL = "-fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: #1f618d;";
+    private static final String TIMER_URGENT = "-fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: #e74c3c;";
+    private static final String TIMER_DONE = "-fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: #2e86c1;";
 
     private final String clientId = UUID.randomUUID().toString();
     private final Gson gson = new Gson();
@@ -109,10 +147,13 @@ public class ClientMain extends Application {
     // Состояние
     private ActiveQuestion current;
     private final Set<Integer> votedQuestions = new HashSet<>();
+    private final Map<Integer, Integer> chosenOptions = new HashMap<>();
+    private final Map<Integer, Integer> pendingVotes = new HashMap<>();
     private final List<PieChart.Data> pieData = new ArrayList<>();
     private final List<Button> optionButtons = new ArrayList<>();
 
-    // Три экрана правой области (одновременно виден один)
+    // Корневой контейнер и три экрана (одновременно виден один)
+    private BorderPane rootPane;
     private final StackPane waitingView = new StackPane();
     private final Label waitingLabel = new Label();
     private ScrollPane activeView;
@@ -122,8 +163,9 @@ public class ClientMain extends Application {
     private final Label themeLabel = label("", "-fx-font-size: 12px; -fx-text-fill: #777777;");
     private final Label pollLabel = label("", "-fx-font-size: 15px; -fx-font-weight: bold;");
     private final Label counterLabel = label("", "-fx-font-size: 12px; -fx-text-fill: #444444;");
+    private final Label timerLabel = label("", TIMER_NORMAL);
     private final Label questionLabel = label("", "-fx-font-size: 17px; -fx-font-weight: bold;");
-    private final Label statusLabel = label("", "-fx-font-size: 13px;");
+    private final Label statusLabel = label("", STATUS_DEFAULT);
 
     // Элементы ведущего
     private final PieChart chart = new PieChart();
@@ -190,7 +232,9 @@ public class ClientMain extends Application {
     }
 
     private VBox header() {
-        return new VBox(4, themeLabel, pollLabel, counterLabel, questionLabel);
+        timerLabel.setVisible(false);
+        timerLabel.setManaged(false);
+        return new VBox(4, themeLabel, pollLabel, counterLabel, timerLabel, questionLabel);
     }
 
     private void buildWaitingView() {
@@ -219,7 +263,7 @@ public class ClientMain extends Application {
         openBtn.setOnAction(e -> {
             CatalogPoll poll = pollsList.getSelectionModel().getSelectedItem();
             if (poll != null) {
-                statusLabel.setText("");
+                setStatus("", STATUS_DEFAULT);
                 sendJson(new OpenPollRequest("host_open_poll", poll.id()));
             }
         });
@@ -274,10 +318,10 @@ public class ClientMain extends Application {
         SplitPane.setResizableWithParent(left, false);
 
         statusLabel.setPadding(new Insets(4, 10, 6, 10));
-        BorderPane root = new BorderPane();
-        root.setCenter(split);
-        root.setBottom(statusLabel);
-        return root;
+        rootPane = new BorderPane();
+        rootPane.setCenter(split);
+        rootPane.setBottom(statusLabel);
+        return rootPane;
     }
 
     private Region buildParticipantLayout() {
@@ -291,10 +335,11 @@ public class ClientMain extends Application {
         StackPane center = new StackPane(waitingView, activeView, summaryView);
 
         statusLabel.setPadding(new Insets(4, 10, 6, 10));
-        BorderPane root = new BorderPane();
-        root.setCenter(center);
-        root.setBottom(statusLabel);
-        return root;
+        rootPane = new BorderPane();
+        rootPane.setStyle(BORDER_DEFAULT);
+        rootPane.setCenter(center);
+        rootPane.setBottom(statusLabel);
+        return rootPane;
     }
 
     /** Ячейки списка переносят длинный текст, а не обрезают его многоточием. */
@@ -319,6 +364,21 @@ public class ClientMain extends Application {
             n.setVisible(visible);
             n.setManaged(visible);
         }
+    }
+
+    private void setParticipantBorder(String style) {
+        if (!host && rootPane != null) {
+            rootPane.setStyle(style);
+        }
+    }
+
+    private void setStatus(String text, String style) {
+        statusLabel.setText(text);
+        statusLabel.setStyle(style);
+    }
+
+    private static boolean isQuiz(ActiveQuestion q) {
+        return q != null && MODE_QUIZ.equals(q.mode());
     }
 
     // ---------- Сеть ----------
@@ -378,7 +438,7 @@ public class ClientMain extends Application {
     }
 
     private void setConnectionLost() {
-        statusLabel.setText("Соединение с сервером потеряно");
+        setStatus("Соединение с сервером потеряно", STATUS_ERROR);
         openBtn.setDisable(true);
         prevBtn.setDisable(true);
         nextBtn.setDisable(true);
@@ -411,6 +471,7 @@ public class ClientMain extends Application {
                 }
                 case "waiting" -> showWaiting();
                 case "active_question" -> showActive(gson.fromJson(obj, ActiveQuestion.class));
+                case "timer_tick" -> handleTimerTick(gson.fromJson(obj, TimerTick.class));
                 case "poll_summary" -> showSummary(gson.fromJson(obj, PollSummary.class));
                 case "vote_ok", "error" -> handleStatus(gson.fromJson(obj, StatusMessage.class));
                 default -> { }
@@ -437,6 +498,9 @@ public class ClientMain extends Application {
         optionButtons.clear();
         answerBox.getChildren().clear();
         resultsBox.getChildren().clear();
+        timerLabel.setVisible(false);
+        timerLabel.setManaged(false);
+        setParticipantBorder(BORDER_DEFAULT);
     }
 
     private void showWaiting() {
@@ -445,7 +509,7 @@ public class ClientMain extends Application {
                 ? "Выберите тему и опрос слева, затем нажмите «Открыть опрос»."
                 : "Ожидание выбора опроса ведущим...");
         showOnly(waitingView);
-        statusLabel.setText("");
+        setStatus("", STATUS_DEFAULT);
     }
 
     private void showActive(ActiveQuestion q) {
@@ -463,6 +527,9 @@ public class ClientMain extends Application {
         pollLabel.setText(q.pollTitle());
         counterLabel.setText("Вопрос " + (q.questionIndex() + 1) + " из " + q.totalQuestions());
         questionLabel.setText(q.text());
+
+        boolean quiz = isQuiz(q);
+        updateTimerUi(quiz, q.revealed(), q.secondsLeft());
 
         if (host) {
             if (sameQuestion && pieData.size() == q.options().size()) {
@@ -487,17 +554,51 @@ public class ClientMain extends Application {
             if (!sameQuestion) {
                 rebuildAnswerButtons(q);
             }
-            applyVotedState();
+            applyParticipantState(q);
+        }
+    }
+
+    private void handleTimerTick(TimerTick tick) {
+        if (tick == null || current == null || !isQuiz(current) || current.revealed()) {
+            return;
+        }
+        if (current.questionId() != tick.questionId()) {
+            return;
+        }
+        updateTimerUi(true, false, tick.secondsLeft());
+    }
+
+    private void updateTimerUi(boolean quiz, boolean revealed, Integer secondsLeft) {
+        timerLabel.setVisible(quiz);
+        timerLabel.setManaged(quiz);
+        if (!quiz) {
+            return;
+        }
+        if (revealed) {
+            timerLabel.setText("Ответы приняты — правильный ответ открыт");
+            timerLabel.setStyle(TIMER_DONE);
+        } else if (secondsLeft != null) {
+            timerLabel.setText("Осталось: " + secondsLeft + " сек");
+            timerLabel.setStyle(secondsLeft <= 3 ? TIMER_URGENT : TIMER_NORMAL);
+        } else {
+            timerLabel.setText("");
         }
     }
 
     private void rebuildResults(ActiveQuestion q) {
         resultsBox.getChildren().clear();
+        boolean revealedQuiz = isQuiz(q) && q.revealed();
+        Integer correctId = q.correctOptionId();
+
         int total = 0;
         for (int i = 0; i < q.options().size(); i++) {
             OptionResult option = q.options().get(i);
             total += option.votes();
-            resultsBox.getChildren().add(label((i + 1) + ". " + option.text() + " — " + option.votes(), null));
+            boolean isCorrect = revealedQuiz && correctId != null && correctId.intValue() == option.id();
+            String text = (i + 1) + ". " + option.text() + " — " + option.votes()
+                    + (isCorrect ? "  ✓ Правильный ответ" : "");
+            String style = isCorrect ? "-fx-text-fill: #1e8449; -fx-font-weight: bold;" : null;
+            resultsBox.getChildren().add(label(text, style));
         }
         resultsBox.getChildren().add(label("Всего голосов: " + total, "-fx-text-fill: #777777;"));
     }
@@ -511,7 +612,7 @@ public class ClientMain extends Application {
             button.setWrapText(true);
             button.setMaxWidth(Double.MAX_VALUE);
             button.setMinHeight(Region.USE_PREF_SIZE);
-            button.setStyle("-fx-font-size: 13px; -fx-alignment: CENTER_LEFT; -fx-padding: 6 10 6 10;");
+            button.setStyle(BTN_BASE);
             button.setOnAction(e -> onVoteClicked(option.id()));
             optionButtons.add(button);
             answerBox.getChildren().add(button);
@@ -525,24 +626,29 @@ public class ClientMain extends Application {
             return;
         }
         resetQuestionState();
-        statusLabel.setText("");
+        setStatus("", STATUS_DEFAULT);
         summaryView.getChildren().setAll(host ? buildHostSummary(s) : buildParticipantSummary(s));
         showOnly(summaryView);
     }
 
     private Node buildHostSummary(PollSummary s) {
-        // Портреты участников
-        VBox portraits = new VBox(8);
-        portraits.setPadding(new Insets(8));
+        boolean quiz = MODE_QUIZ.equals(s.mode());
+
+        // Вкладка 1: портреты (для опроса) или рейтинг с баллами (для викторины)
+        VBox participantsBox = new VBox(8);
+        participantsBox.setPadding(new Insets(8));
         List<SummaryParticipant> participants = s.participants() == null ? List.of() : s.participants();
         if (participants.isEmpty()) {
-            portraits.getChildren().add(label("В этом опросе никто не проголосовал.", null));
+            participantsBox.getChildren().add(label("В этом опросе никто не проголосовал.", null));
         }
+        int rank = 1;
         for (SummaryParticipant p : participants) {
-            portraits.getChildren().add(participantCard(p, p.displayName()));
+            participantsBox.getChildren().add(quiz
+                    ? quizParticipantCard(p, rank++)
+                    : pollParticipantCard(p, p.displayName()));
         }
 
-        // Сводка по вопросам
+        // Вкладка 2: сводка по вопросам
         VBox questions = new VBox(8);
         questions.setPadding(new Insets(8));
         if (s.questions() != null) {
@@ -553,8 +659,11 @@ public class ClientMain extends Application {
                 for (int i = 0; i < q.options().size(); i++) {
                     SummaryOption o = q.options().get(i);
                     int percent = q.totalVotes() == 0 ? 0 : (int) Math.round(o.votes() * 100.0 / q.totalVotes());
-                    card.getChildren().add(label((i + 1) + ") " + o.text() + " — " + o.votes()
-                            + " (" + percent + "%)", null));
+                    boolean isCorrect = quiz && q.correctOptionId() != null && q.correctOptionId().intValue() == o.id();
+                    String text = (i + 1) + ") " + o.text() + " — " + o.votes() + " (" + percent + "%)"
+                            + (isCorrect ? "  ✓ Правильный ответ" : "");
+                    String style = isCorrect ? "-fx-text-fill: #1e8449; -fx-font-weight: bold;" : null;
+                    card.getChildren().add(label(text, style));
                 }
                 card.getChildren().add(label("Всего голосов: " + q.totalVotes(), "-fx-text-fill: #777777;"));
                 questions.getChildren().add(card);
@@ -562,7 +671,7 @@ public class ClientMain extends Application {
         }
 
         TabPane tabs = new TabPane(
-                new Tab("Портреты участников", scroll(portraits)),
+                new Tab(quiz ? "Результаты участников" : "Портреты участников", scroll(participantsBox)),
                 new Tab("Сводка по вопросам", scroll(questions)));
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
 
@@ -583,9 +692,12 @@ public class ClientMain extends Application {
     }
 
     private Node buildParticipantSummary(PollSummary s) {
+        boolean quiz = MODE_QUIZ.equals(s.mode());
+
         VBox box = new VBox(8);
         box.setPadding(new Insets(10));
-        box.getChildren().add(label("Ваш итог по опросу", "-fx-font-size: 17px; -fx-font-weight: bold;"));
+        box.getChildren().add(label(quiz ? "Итоги викторины" : "Ваш итог по опросу",
+                "-fx-font-size: 17px; -fx-font-weight: bold;"));
         box.getChildren().add(label(s.pollTitle(), "-fx-text-fill: #555555;"));
 
         SummaryParticipant mine = null;
@@ -598,14 +710,63 @@ public class ClientMain extends Application {
             }
         }
         if (mine == null) {
-            box.getChildren().add(label("Вы не участвовали в этом опросе.", "-fx-font-size: 14px;"));
+            box.getChildren().add(label(quiz
+                    ? "Вы не участвовали в этой викторине."
+                    : "Вы не участвовали в этом опросе.", "-fx-font-size: 14px;"));
+        } else if (quiz) {
+            box.getChildren().add(quizParticipantCard(mine, null));
         } else {
-            box.getChildren().add(participantCard(mine, mine.displayName()));
+            box.getChildren().add(pollParticipantCard(mine, mine.displayName()));
         }
         return scroll(box);
     }
 
-    private VBox participantCard(SummaryParticipant p, String name) {
+    private VBox quizParticipantCard(SummaryParticipant p, Integer rank) {
+        int grade = p.grade10() != null ? p.grade10() : 0;
+        int correct = p.correctCount() != null ? p.correctCount() : 0;
+        String gradeColor = grade >= 7 ? "#1e8449" : (grade >= 4 ? "#d68910" : "#c0392b");
+
+        VBox card = new VBox(4);
+        card.setStyle(CARD_STYLE);
+
+        String headerName = (rank != null ? "#" + rank + "  " : "") + p.displayName();
+        card.getChildren().add(label(headerName, "-fx-font-size: 15px; -fx-font-weight: bold;"));
+        card.getChildren().add(label(
+                (rank == null ? "Ваша оценка: " : "Оценка: ") + grade + " / 10",
+                "-fx-font-size: 17px; -fx-font-weight: bold; -fx-text-fill: " + gradeColor + ";"));
+        card.getChildren().add(label(
+                "Правильных ответов: " + correct + " из " + p.totalQuestions()
+                        + " (отвечено: " + p.answeredCount() + ")",
+                "-fx-font-weight: bold;"));
+
+        if (p.verdict() != null && !p.verdict().isBlank()) {
+            card.getChildren().add(label(p.verdict(), "-fx-font-style: italic; -fx-padding: 4 0 4 0;"));
+        }
+
+        if (p.answers() != null && !p.answers().isEmpty()) {
+            card.getChildren().add(label("Разбор ответов:", "-fx-font-weight: bold;"));
+            for (SummaryAnswer a : p.answers()) {
+                boolean ok = Boolean.TRUE.equals(a.correct());
+                if (ok) {
+                    card.getChildren().add(label(
+                            "✓ Вопрос " + a.questionNumber() + ": " + a.optionText(),
+                            "-fx-text-fill: #1e8449;"));
+                } else {
+                    card.getChildren().add(label(
+                            "✗ Вопрос " + a.questionNumber() + ": " + a.optionText(),
+                            "-fx-text-fill: #c0392b;"));
+                    if (a.correctOptionText() != null && !a.correctOptionText().isBlank()) {
+                        card.getChildren().add(label(
+                                "   Правильный ответ: " + a.correctOptionText(),
+                                "-fx-text-fill: #555555; -fx-font-size: 12px;"));
+                    }
+                }
+            }
+        }
+        return card;
+    }
+
+    private VBox pollParticipantCard(SummaryParticipant p, String name) {
         VBox card = new VBox(4);
         card.setStyle(CARD_STYLE);
         card.getChildren().add(label(name, "-fx-font-size: 15px; -fx-font-weight: bold;"));
@@ -641,10 +802,13 @@ public class ClientMain extends Application {
         if (current == null || votedQuestions.contains(current.questionId())) {
             return;
         }
-        // Блокируем сразу, чтобы двойной клик не отправил два голоса;
-        // при ошибке кнопки вернутся в нужное состояние через updateButtonsEnabled
+        if (isQuiz(current) && current.revealed()) {
+            return;
+        }
+        // Запоминаем выбранный вариант до подтверждения сервера и блокируем повторный клик
+        pendingVotes.put(current.questionId(), optionId);
         optionButtons.forEach(b -> b.setDisable(true));
-        statusLabel.setText("Отправка голоса...");
+        setStatus("Отправка голоса...", STATUS_DEFAULT);
         sendJson(new VoteRequest("vote", current.questionId(), optionId, clientId));
     }
 
@@ -655,30 +819,99 @@ public class ClientMain extends Application {
         boolean voteConfirmed = "vote_ok".equals(m.type());
         boolean alreadyVoted = "already_voted".equals(m.code());
 
-        if ((voteConfirmed || alreadyVoted) && m.questionId() != null) {
+        if (voteConfirmed && m.questionId() != null) {
+            Integer chosen = pendingVotes.remove(m.questionId());
+            if (chosen != null) {
+                chosenOptions.put(m.questionId(), chosen);
+            }
             votedQuestions.add(m.questionId());
-            if (!host) {
-                applyVotedState();
+            if (!host && current != null && current.questionId() == m.questionId()) {
+                applyParticipantState(current);
             }
             return;
         }
 
-        if (!host) {
-            updateButtonsEnabled();
+        if (alreadyVoted && m.questionId() != null) {
+            pendingVotes.remove(m.questionId());
+            votedQuestions.add(m.questionId());
+            if (!host && current != null && current.questionId() == m.questionId()) {
+                applyParticipantState(current);
+            }
+            return;
         }
-        statusLabel.setText(m.message() != null ? m.message() : "Ошибка");
+
+        if (m.questionId() != null) {
+            pendingVotes.remove(m.questionId());
+        }
+        if (!host && current != null) {
+            applyParticipantState(current);
+        }
+        setStatus(m.message() != null ? m.message() : "Ошибка", STATUS_ERROR);
     }
 
-    private void updateButtonsEnabled() {
-        boolean voted = current != null && votedQuestions.contains(current.questionId());
-        optionButtons.forEach(b -> b.setDisable(voted));
+    private void applyParticipantState(ActiveQuestion q) {
+        boolean quiz = isQuiz(q);
+        int qId = q.questionId();
+        boolean voted = votedQuestions.contains(qId);
+        boolean pending = pendingVotes.containsKey(qId);
+        Integer chosenId = chosenOptions.get(qId);
+
+        if (quiz && q.revealed()) {
+            Integer correctId = q.correctOptionId();
+            for (int i = 0; i < q.options().size() && i < optionButtons.size(); i++) {
+                OptionResult opt = q.options().get(i);
+                Button btn = optionButtons.get(i);
+                btn.setDisable(true);
+
+                boolean isCorrectOpt = correctId != null && correctId.intValue() == opt.id();
+                boolean isChosenOpt = chosenId != null && chosenId.intValue() == opt.id();
+
+                if (isCorrectOpt) {
+                    btn.setText((i + 1) + ". " + opt.text() + "  ✓ Правильный ответ");
+                    btn.setStyle(BTN_CORRECT);
+                } else if (isChosenOpt) {
+                    btn.setText((i + 1) + ". " + opt.text() + "  ✗ Ваш ответ");
+                    btn.setStyle(BTN_WRONG);
+                } else {
+                    btn.setText((i + 1) + ". " + opt.text());
+                    btn.setStyle(BTN_NORMAL_DISABLED);
+                }
+            }
+
+            if (chosenId == null) {
+                setParticipantBorder(BORDER_WRONG);
+                setStatus("Время вышло! Вы не ответили.", STATUS_ERROR);
+            } else if (correctId != null && chosenId.equals(correctId)) {
+                setParticipantBorder(BORDER_CORRECT);
+                setStatus("Вы ответили правильно!", STATUS_SUCCESS);
+            } else {
+                setParticipantBorder(BORDER_WRONG);
+                setStatus("Вы ответили неправильно!", STATUS_ERROR);
+            }
+            return;
+        }
+
+        setParticipantBorder(BORDER_DEFAULT);
+        for (int i = 0; i < q.options().size() && i < optionButtons.size(); i++) {
+            OptionResult opt = q.options().get(i);
+            Button btn = optionButtons.get(i);
+            btn.setText((i + 1) + ". " + opt.text());
+            btn.setDisable(voted || pending);
+
+            boolean isChosen = chosenId != null && chosenId.intValue() == opt.id();
+            btn.setStyle(isChosen ? BTN_CHOSEN : BTN_BASE);
+        }
+
+        if (voted) {
+            setStatus(quiz
+                    ? "Ответ принят. Ожидаем остальных или окончания таймера..."
+                    : "Ваш голос учтён", STATUS_DEFAULT);
+        } else if (!pending) {
+            setStatus("Выберите вариант ответа", STATUS_DEFAULT);
+        }
     }
 
-    private void applyVotedState() {
-        updateButtonsEnabled();
-        boolean voted = current != null && votedQuestions.contains(current.questionId());
-        statusLabel.setText(voted ? "Ваш голос учтён" : "Выберите вариант ответа");
-    }
+    private static final String BTN_NORMAL_DISABLED = BTN_BASE;
 
     // ---------- Завершение ----------
 
